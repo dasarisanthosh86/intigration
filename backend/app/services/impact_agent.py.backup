@@ -1,0 +1,815 @@
+#!/usr/bin/env python3
+"""
+Impact Analysis Agent - Fixed Version
+Analyzes GitHub repositories and generates tech stack recommendations using Groq API
+"""
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse
+
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import json
+import os
+import urllib.request
+
+import subprocess
+import tempfile
+import shutil
+from datetime import datetime
+from io import BytesIO
+import uvicorn
+import socket
+import time
+import random
+
+# Load environment variables from .env file
+def load_env():
+    try:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+        with open(env_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and '=' in line and not line.startswith('#'):
+                    key, value = line.split('=', 1)
+                    os.environ[key] = value
+
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        pass
+
+
+load_env()
+
+try:
+    import PyPDF2
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
+
+try:
+    import docx
+    from docx import Document
+    DOC_SUPPORT = True
+except ImportError:
+    DOC_SUPPORT = False
+
+# Configuration
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_TEMPERATURE = float(os.getenv("GROQ_TEMPERATURE", "0.3"))
+GROQ_URL = os.getenv("GROQ_URL", "https://api.groq.com/openai/v1/chat/completions")
+GENERATED_FILES_DIR = os.getenv("GENERATED_FILES_DIR", "generated_files")
+
+def find_available_port(start_port=8090, max_attempts=10):
+    """Find an available port starting from start_port"""
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', port))
+                return port
+        except OSError:
+            continue
+    raise Exception(f"No available ports found in range {start_port}-{start_port + max_attempts - 1}")
+
+# Dynamic port selection
+port_env = os.getenv("PORT", "dynamic")
+PORT = find_available_port() if port_env == "dynamic" else int(port_env)
+
+
+
+
+# FastAPI app with CORS
+app = FastAPI(
+    title="Impact Analysis Agent", 
+    description="Analyzes GitHub repositories and generates tech stack recommendations",
+    docs_url="/api/docs", 
+    redoc_url="/api/redoc"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Pydantic models
+class AnalysisRequest(BaseModel):
+    repo_url: str
+    architecture_content: str
+    prd_content: str = ""
+
+class FileUploadResponse(BaseModel):
+    success: bool
+    extracted_text: str = ""
+    filename: str = ""
+    error: str = ""
+
+class AnalysisResponse(BaseModel):
+    success: bool
+    analysis: str = ""
+    document_id: str = ""
+    timestamp: str = ""
+    error: str = ""
+
+# Simple agent class
+class ImpactAnalysisAgent:
+    def __init__(self):
+        self.groq_api_key = GROQ_API_KEY
+        self.model = GROQ_MODEL
+        self.temperature = GROQ_TEMPERATURE
+        self.groq_url = GROQ_URL
+
+    
+    def extract_text_from_file(self, file_data, filename):
+        """Extract text from various file formats"""
+        try:
+            file_ext = os.path.splitext(filename)[1].lower()
+            
+            if file_ext == '.pdf' and PDF_SUPPORT:
+                return self._extract_pdf_text(file_data)
+            elif file_ext in ['.doc', '.docx'] and DOC_SUPPORT:
+                return self._extract_doc_text(file_data)
+            else:
+                return file_data.decode('utf-8', errors='ignore')
+        except Exception as e:
+            raise Exception(f"Failed to extract text from {filename}: {str(e)}")
+    
+    def _extract_pdf_text(self, file_data):
+        """Extract text from PDF files"""
+        try:
+            pdf_reader = PyPDF2.PdfReader(BytesIO(file_data))
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            return text
+        except Exception as e:
+            raise Exception(f"PDF extraction failed: {str(e)}")
+    
+    def _extract_doc_text(self, file_data):
+        """Extract text from DOC/DOCX files"""
+        try:
+            doc = docx.Document(BytesIO(file_data))
+            text = ""
+            for paragraph in doc.paragraphs:
+                text += paragraph.text + "\n"
+            return text
+        except Exception as e:
+            raise Exception(f"DOC extraction failed: {str(e)}")
+    
+    def generate_pdf(self, content, title="Document"):
+        """Generate PDF from text content"""
+        if not PDF_SUPPORT:
+            raise Exception("PDF generation not supported - missing dependencies")
+        
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = []
+        
+        # Add title
+        story.append(Paragraph(title, styles['Title']))
+        story.append(Spacer(1, 12))
+        
+        # Add content paragraphs
+        for line in content.split('\n'):
+            if line.strip():
+                story.append(Paragraph(line, styles['Normal']))
+                story.append(Spacer(1, 6))
+        
+        doc.build(story)
+        buffer.seek(0)
+        return buffer.getvalue()
+    
+    def generate_docx(self, content, title="Document"):
+        """Generate DOCX from text content"""
+        if not DOC_SUPPORT:
+            raise Exception("DOCX generation not supported - missing dependencies")
+        
+        doc = Document()
+        doc.add_heading(title, 0)
+        
+        for line in content.split('\n'):
+            if line.strip():
+                doc.add_paragraph(line)
+        
+        buffer = BytesIO()
+        doc.save(buffer)
+        buffer.seek(0)
+        return buffer.getvalue()
+    
+    def _detect_languages_from_url(self, repo_url):
+        """Detect likely programming languages from repository URL without LLM"""
+        return set(['.js', '.html', '.css', '.jsx', '.ts', '.tsx'])
+    
+    def _get_frontend_extensions(self, architecture_content):
+        """Get frontend file extensions without LLM"""
+        return ['.js', '.jsx', '.ts', '.tsx', '.vue', '.html', '.css']
+    
+    def _get_programming_extensions(self, repo_url):
+        """Get programming extensions without LLM"""
+        return ['.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.go', '.rs', '.php', '.rb', '.cs', '.html', '.css']
+    
+    def clone_and_analyze_repo(self, repo_url):
+        """Clone and analyze GitHub repository with fallback options"""
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
+            # Try different clone methods
+            clone_commands = [
+                ['git', 'clone', '--depth', '1', repo_url, temp_dir],
+                ['git', 'clone', repo_url, temp_dir]
+            ]
+            
+            clone_success = False
+            last_error = None
+            
+            for cmd in clone_commands:
+                try:
+                    timeout_val = int(os.getenv("GIT_CLONE_TIMEOUT", "60"))
+                    result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout_val)
+                    clone_success = True
+                    break
+                except subprocess.CalledProcessError as e:
+                    last_error = e
+                    continue
+                except subprocess.TimeoutExpired:
+                    last_error = Exception("Git clone timeout")
+                    continue
+            
+            if not clone_success:
+                # Return basic analysis without cloning
+                return {
+                    'files': {},
+                    'structure': ['Repository clone failed - analysis based on URL only'],
+                    'languages': self._detect_languages_from_url(repo_url),
+                    'frameworks': [],
+                    'dependencies': {},
+                    'clone_error': str(last_error)
+                }
+            
+            repo_analysis = {
+                'files': {},
+                'structure': [],
+                'languages': set(),
+                'frameworks': [],
+                'dependencies': {}
+            }
+            
+            for root, dirs, files in os.walk(temp_dir):
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', '__pycache__']]
+                
+                for file in files:
+                    if file.startswith('.'):
+                        continue
+                        
+                    file_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(file_path, temp_dir)
+                    file_ext = os.path.splitext(file)[1].lower()
+                    
+                    repo_analysis['structure'].append(rel_path)
+                    
+                    prog_exts = self._get_programming_extensions(repo_url)
+                    if file_ext in prog_exts:
+                        repo_analysis['languages'].add(file_ext)
+            
+            return repo_analysis
+            
+        except Exception as e:
+            # Return fallback analysis
+            return {
+                'files': {},
+                'structure': ['Repository analysis unavailable'],
+                'languages': self._detect_languages_from_url(repo_url),
+                'frameworks': [],
+                'dependencies': {},
+                'analysis_error': str(e)
+            }
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    def call_groq_api(self, prompt, max_retries=3):
+        """Make API call to Groq with retry logic for rate limits"""
+        if not self.groq_api_key:
+            raise Exception("GROQ_API_KEY not configured")
+            
+        for attempt in range(max_retries):
+            try:
+                model_to_use = self.model
+                
+                data = {
+                    "messages": [{"role": "user", "content": prompt}],
+                    "model": model_to_use,
+                    "temperature": self.temperature,
+                    "max_tokens": int(os.getenv("GROQ_MAX_TOKENS", "4500"))
+                }
+                
+                headers = {
+                    'Authorization': f'Bearer {self.groq_api_key}',
+                    'Content-Type': 'application/json'
+                }
+                
+                req = urllib.request.Request(
+                    self.groq_url,
+                    data=json.dumps(data).encode('utf-8'),
+                    headers=headers
+                )
+                
+                with urllib.request.urlopen(req) as response:
+                    result = json.loads(response.read().decode('utf-8'))
+                    return result['choices'][0]['message']['content']
+                    
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode('utf-8')
+                
+                # Handle rate limit specifically
+                if e.code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = 10 + (attempt * 15) + random.uniform(0, 5)
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise Exception(f"Rate limit exceeded after {max_retries} attempts. Please wait 60 seconds and try again.")
+                else:
+                    raise Exception(f"Groq API Error {e.code}: {error_body}")
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                raise Exception(f"API call failed: {str(e)}")
+        
+        raise Exception("Max retries exceeded")
+    
+    def analyze_with_groq(self, repo_url, repo_analysis, architecture_content, prd_content=None):
+        """Generate comprehensive analysis using Groq API"""
+        try:
+            # Truncate architecture content if too long
+            max_arch_chars = int(os.getenv("MAX_ARCH_CHARS", "3000"))
+            if len(architecture_content) > max_arch_chars:
+                architecture_content = architecture_content[:max_arch_chars] + "\n[Content truncated due to length]"
+            
+            # Extract key repo info using LLM
+            frontend_exts = self._get_frontend_extensions(architecture_content)
+            frontend_files = [f for f in repo_analysis['structure'][:5] if any(f.endswith(ext.strip()) for ext in frontend_exts)]
+            languages = list(repo_analysis['languages'])[:3]
+            
+            prompt = f"""Analyze this frontend repo and architecture document to provide comprehensive tech stack justification and alternatives:
+
+REPO: {repo_url}
+LANGUAGES: {', '.join(languages)}
+FRONTEND FILES: {', '.join(frontend_files)}
+
+ARCHITECTURE:
+{architecture_content}
+
+PRD CONTENT:
+{prd_content or 'Not provided'}
+
+Generate output with:
+
+# PROJECT SUMMARY
+**Repository**: {repo_url}
+[Generate a concise project summary based on the repository analysis and architecture document]
+
+# ARCHITECTURE DIAGRAM
+[Create an ASCII-based system architecture diagram showing the flow between frontend, backend, database, and external services. Use boxes, arrows, and clear labels]
+
+# TECH STACK JUSTIFICATION
+[For each technology mentioned in the architecture document, provide detailed justification why it's suitable for this project, including pros/cons and fit with requirements]
+
+# ALTERNATIVE TECH STACKS
+## Backend Alternatives:
+- Option 1: [Framework/Language] - Pros, Cons, Performance, Scalability
+- Option 2: [Framework/Language] - Pros, Cons, Performance, Scalability
+- Option 3: [Framework/Language] - Pros, Cons, Performance, Scalability
+
+## Database Alternatives:
+- Option 1: [Database Type] - Use cases, Performance, Cost
+- Option 2: [Database Type] - Use cases, Performance, Cost
+- Option 3: [Database Type] - Use cases, Performance, Cost
+
+
+
+# DATABASE SCHEMA DESIGN
+[Based on architecture requirements, design database tables with fields, data types, relationships, and indexes]
+
+# RECOMMENDED API ENDPOINTS
+[Based on the architecture requirements, suggest complete API specification with:
+- HTTP methods (GET, POST, PUT, DELETE)
+- Full endpoint paths
+- Request/response body formats
+- Authentication requirements
+- Input validation rules
+- Error response formats]
+
+## Input Fields for Each Endpoint:
+[For each API endpoint, specify:
+- Required input fields with data types
+- Optional input fields with defaults
+- Validation rules (min/max length, format, etc.)
+- Example request payloads
+- Field descriptions and purposes]
+
+# DETAILED PROJECT CONSTRUCTION GUIDE
+[Use the BEST ALTERNATIVE tech stack from the alternatives analysis above. If architecture document tech stack is clearly superior, use that instead. Clearly state which tech stack combination you're using for this guide.]
+
+## Phase 1: Environment Setup
+1. Install [SPECIFIC BACKEND FRAMEWORK] development environment
+2. Setup [SPECIFIC DATABASE] server and tools
+3. Initialize Git repository with proper .gitignore
+4. Create project folder structure for chosen tech stack
+5. Setup package managers and dependency files
+6. Configure environment variables template
+
+## Phase 2: Backend Development
+1. Install [SPECIFIC FRAMEWORK] and create initial project structure
+2. Configure [SPECIFIC DATABASE] connection with credentials
+3. Create database models/entities based on schema design above
+4. Create input validation schemas for all API endpoints
+5. Implement each API endpoint with detailed input/output handling
+6. Setup JWT/OAuth authentication with input validation
+7. Add middleware for logging, CORS, rate limiting, input sanitization
+8. Create comprehensive test suites for all endpoints and input validation
+
+## Phase 3: Database Implementation
+1. Setup [SPECIFIC DATABASE TYPE] server (local/cloud)
+2. Run database migrations to create schema from design above
+3. Create seed scripts with sample data
+4. Add database indexes for performance optimization
+5. Setup automated backup procedures
+6. Configure connection pooling and optimization
+
+## Phase 4: Integration
+1. Connect existing frontend to new backend APIs
+2. Update frontend API calls to match new endpoints
+3. Implement error handling and loading states
+4. Add authentication flow integration
+5. Test all frontend-backend data flows
+6. Optimize API response times and caching
+
+Provide SPECIFIC commands, code snippets, and configuration examples for the CHOSEN tech stack in each step."""
+            
+            return self.call_groq_api(prompt)
+            
+        except Exception as e:
+            return f"Error generating analysis: {str(e)}"
+
+# Initialize agent
+agent = ImpactAnalysisAgent()
+
+# Routes
+@app.get("/", response_class=HTMLResponse)
+async def read_root():
+    """Serve the main HTML page"""
+    html_content = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Impact Analysis Agent</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1 { color: #333; text-align: center; margin-bottom: 30px; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }
+        input[type="url"], input[type="file"] { width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 5px; }
+        input[type="file"] { padding: 8px; }
+        button { background: #007bff; color: white; padding: 12px 30px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .status { margin-top: 20px; padding: 10px; border-radius: 5px; }
+        .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .results { margin-top: 30px; padding: 20px; background: #f8f9fa; border-radius: 5px; }
+        .download-buttons { margin: 10px 0; }
+        .btn-small { background: #28a745; color: white; padding: 5px 10px; margin: 2px; border: none; border-radius: 3px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 Impact Analysis Agent</h1>
+        <p style="text-align: center; color: #666; margin-bottom: 30px;">
+            ✨ Intelligent GitHub Repository Analysis & Tech Stack Recommendations ✨
+        </p>
+        
+        <form id="analysisForm">
+            <div class="form-group">
+                <label for="repoUrl">GitHub Repository URL:</label>
+                <input type="url" id="repoUrl" placeholder="https://github.com/username/repository" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="archFile">🏗️ Architecture Document (Required - Primary Focus):</label>
+                <input type="file" id="archFile" accept=".pdf,.doc,.docx,.txt,.json" required>
+                <small style="color: #666;">📋 Main analysis input: System architecture, tech requirements, design specifications</small>
+            </div>
+            
+            <div class="form-group">
+                <label for="prdFile">📄 PRD Document (Optional Reference Only):</label>
+                <input type="file" id="prdFile" accept=".pdf,.doc,.docx,.txt,.json">
+                <small style="color: #666;">📝 Additional context only - analysis focuses on architecture document</small>
+            </div>
+            
+            <button type="submit" id="analyzeBtn">🔍 Analyze Project</button>
+        </form>
+        
+        <div id="status"></div>
+        <div id="results" style="display: none;">
+            <h3>📋 Analysis Results</h3>
+            <div class="download-buttons">
+                <button class="btn-small" onclick="downloadDocument('prompt', 'txt')">Download TXT</button>
+                <button class="btn-small" onclick="downloadDocument('prompt', 'json')">Download JSON</button>
+                <button class="btn-small" onclick="downloadDocument('prompt', 'pdf')">Download PDF</button>
+                <button class="btn-small" onclick="downloadDocument('prompt', 'docx')">Download DOCX</button>
+            </div>
+            <div id="analysisContent"></div>
+            
+        </div>
+    </div>
+
+    <script>
+        let fileContents = { architecture: '', prd: '' };
+        let currentDocumentId = null;
+
+        // File upload handlers
+        document.getElementById('archFile').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                await handleFileUpload(file, 'Architecture', 'architecture');
+            }
+        });
+
+        document.getElementById('prdFile').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                await handleFileUpload(file, 'PRD', 'prd');
+            }
+        });
+
+        async function handleFileUpload(file, fileType, contentKey) {
+            const status = document.getElementById('status');
+            status.innerHTML = `<div style="color: #007bff;">📄 Processing ${fileType} file...</div>`;
+            
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+                
+                const response = await fetch('/upload-file', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    fileContents[contentKey] = data.extracted_text;
+                    status.innerHTML = `<div class="success">✅ ${fileType} file processed successfully!</div>`;
+                } else {
+                    throw new Error(data.error || 'File processing failed');
+                }
+            } catch (error) {
+                fileContents[contentKey] = '';
+                status.innerHTML = `<div class="error">❌ ${fileType} File Error: ${error.message}</div>`;
+            }
+        }
+
+        // Form submission
+        document.getElementById('analysisForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const repoUrl = document.getElementById('repoUrl').value;
+            const analyzeBtn = document.getElementById('analyzeBtn');
+            const status = document.getElementById('status');
+            const results = document.getElementById('results');
+            
+            if (!fileContents.architecture) {
+                status.innerHTML = '<div class="error">❌ Please upload an Architecture document first!</div>';
+                return;
+            }
+            
+            analyzeBtn.disabled = true;
+            analyzeBtn.textContent = '🔄 Analyzing...';
+            status.innerHTML = '<div style="color: #007bff;">🔄 Analyzing repository...</div>';
+            
+            try {
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        repo_url: repoUrl,
+                        architecture_content: fileContents.architecture,
+                        prd_content: fileContents.prd
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    currentDocumentId = data.document_id;
+                    document.getElementById('analysisContent').innerHTML = 
+                        `<pre style="background: #f8f9fa; padding: 15px; border-radius: 5px; white-space: pre-wrap;">${data.analysis}</pre>`;
+                    results.style.display = 'block';
+                    status.innerHTML = '<div class="success">✅ Analysis completed successfully!</div>';
+                } else {
+                    throw new Error(data.error || 'Analysis failed');
+                }
+            } catch (error) {
+                status.innerHTML = `<div class="error">❌ Error: ${error.message}</div>`;
+            } finally {
+                analyzeBtn.disabled = false;
+                analyzeBtn.textContent = '🔍 Analyze Project';
+            }
+        });
+
+        async function downloadDocument(docType, format) {
+            if (!currentDocumentId) {
+                alert('No documents available for download');
+                return;
+            }
+            
+            try {
+                const url = `/download/${currentDocumentId}/${docType}/${format}`;
+                const response = await fetch(url);
+                
+                if (!response.ok) {
+                    throw new Error(`Download failed: ${response.status}`);
+                }
+                
+                const blob = await response.blob();
+                const downloadUrl = window.URL.createObjectURL(blob);
+                
+                const link = document.createElement('a');
+                link.href = downloadUrl;
+                link.download = `${docType}_${currentDocumentId}.${format}`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                
+                window.URL.revokeObjectURL(downloadUrl);
+            } catch (error) {
+                alert(`Download failed: ${error.message}`);
+            }
+        }
+    </script>
+</body>
+</html>
+    """
+    return HTMLResponse(content=html_content)
+
+@app.post("/upload-file", response_model=FileUploadResponse)
+async def upload_file(file: UploadFile = File(...)):
+    """Handle file upload and text extraction"""
+    try:
+        file_data = await file.read()
+        extracted_text = agent.extract_text_from_file(file_data, file.filename)
+        
+        return FileUploadResponse(
+            success=True,
+            extracted_text=extracted_text,
+            filename=file.filename
+        )
+    except Exception as e:
+        return FileUploadResponse(
+            success=False,
+            error=str(e)
+        )
+
+@app.post("/analyze", response_model=AnalysisResponse)
+async def analyze_project(request: AnalysisRequest):
+    """Handle analysis requests"""
+    try:
+        if not request.repo_url:
+            raise HTTPException(status_code=400, detail="Repository URL is required")
+        
+        if not request.architecture_content:
+            raise HTTPException(status_code=400, detail="Architecture document is required")
+        
+        # Analyze repository
+        repo_analysis = agent.clone_and_analyze_repo(request.repo_url)
+        
+        # Generate analysis
+        analysis = agent.analyze_with_groq(
+            request.repo_url, 
+            repo_analysis, 
+            request.architecture_content, 
+            request.prd_content
+        )
+        
+        # Save documents
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs(GENERATED_FILES_DIR, exist_ok=True)
+        
+        documents = {
+            'prompt': analysis,
+            'architecture': request.architecture_content,
+            'prd': request.prd_content or 'No PRD document provided',
+            'repository_url': request.repo_url
+        }
+        
+        with open(f'{GENERATED_FILES_DIR}/documents_{timestamp}.json', 'w', encoding='utf-8') as f:
+            json.dump(documents, f, indent=2)
+        
+        return AnalysisResponse(
+            success=True,
+            analysis=analysis,
+            document_id=timestamp,
+            timestamp=datetime.now().isoformat()
+        )
+        
+    except Exception as e:
+        return AnalysisResponse(
+            success=False,
+            error=str(e)
+        )
+
+@app.get("/download/{document_id}/{doc_type}/{format_type}")
+async def download_document(document_id: str, doc_type: str, format_type: str):
+    """Handle document downloads"""
+    try:
+        json_path = f'{GENERATED_FILES_DIR}/documents_{document_id}.json'
+        
+        if not os.path.exists(json_path):
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        with open(json_path, 'r', encoding='utf-8') as f:
+            documents = json.load(f)
+        
+        if doc_type not in documents:
+            raise HTTPException(status_code=404, detail="Document type not found")
+        
+        content = documents[doc_type]
+        filename = f"{doc_type}_{document_id}"
+        
+        if format_type == 'json':
+            json_content = json.dumps({"content": content}, indent=2)
+            return StreamingResponse(
+                BytesIO(json_content.encode('utf-8')),
+                media_type='application/json',
+                headers={"Content-Disposition": f"attachment; filename={filename}.json"}
+            )
+        elif format_type == 'txt':
+            return StreamingResponse(
+                BytesIO(content.encode('utf-8')),
+                media_type='text/plain',
+                headers={"Content-Disposition": f"attachment; filename={filename}.txt"}
+            )
+        elif format_type == 'pdf':
+            if not PDF_SUPPORT:
+                raise HTTPException(status_code=400, detail="PDF generation not supported")
+            pdf_data = agent.generate_pdf(content, f"{doc_type.title()} - {document_id}")
+            return StreamingResponse(
+                BytesIO(pdf_data),
+                media_type='application/pdf',
+                headers={"Content-Disposition": f"attachment; filename={filename}.pdf"}
+            )
+        elif format_type == 'docx':
+            if not DOC_SUPPORT:
+                raise HTTPException(status_code=400, detail="DOCX generation not supported")
+            docx_data = agent.generate_docx(content, f"{doc_type.title()} - {document_id}")
+            return StreamingResponse(
+                BytesIO(docx_data),
+                media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                headers={"Content-Disposition": f"attachment; filename={filename}.docx"}
+            )
+        else:
+            raise HTTPException(status_code=400, detail="Invalid format")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def main():
+    """Main function to start the server"""
+    try:
+        port_env = os.getenv("PORT", "dynamic")
+        if port_env == "dynamic":
+            port_to_use = find_available_port()
+            print(f"Using dynamic port: {port_to_use}")
+        else:
+            configured_port = int(port_env)
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(('127.0.0.1', configured_port))
+                port_to_use = configured_port
+            except OSError:
+                port_to_use = find_available_port()
+                print(f"Port {configured_port} is busy, using port {port_to_use} instead")
+        
+        print(f"Starting server on http://127.0.0.1:{port_to_use}")
+        uvicorn.run(app, host="127.0.0.1", port=port_to_use, log_level="info")
+    except Exception as e:
+        print(f"Failed to start server: {e}")
+        raise
+
+if __name__ == "__main__":
+    main()
